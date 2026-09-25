@@ -62,7 +62,7 @@ def calibration_slots(
     ),
     db: Connection = Depends(get_db),
 ):
-    """输入仪器、UTC 起止时间与所需时长，返回时间窗内**最早可用时段**。
+    """输入仪器、UTC 起止时间与所需时长，返回时间窗内**最早可确认时段**。
 
     计算规则：
 
@@ -71,12 +71,24 @@ def calibration_slots(
        （如 ``[09,10)`` 与 ``[10,11)``）互不冲突；
     2. **生效中的维护封锁窗口与预约一并视作工位占用**（响应分别在
        ``busy`` 与 ``maintenance_windows`` 中列出），空档计算须同时避开；
-    3. 在**查询起点**要求该仪器存在**唯一且校验通过**的溯源链，预约
-       必须在其**起点证书到期前结束**（``end <= valid_until``），
-       搜索窗右端据此裁剪；链不可用（无有效证书/起点不唯一/多候选/
-       断裂/校验失败）时 ``slot=null`` 并在 ``reason`` 中说明原因，
-       完整证据见 ``trace_report``；
-    4. 在裁剪后的搜索窗内按占用段贪心求最早可容纳所需时长的空档。
+    3. **查询起点**要求该仪器存在**唯一且校验通过**的溯源链（入口门禁；
+       不可用时 ``slot=null``、``reason_code=TRACEABILITY_CHAIN_UNAVAILABLE``，
+       完整证据见 ``trace_report``）；
+    4. 在合并占用上贪心求物理最早空档，并**对每个候选起点重放与预约
+       确认相同的门禁**——占用把建议起点推后后不沿用查询起点的旧结论：
+       候选起点须唯一成链且候选结束不晚于该起点证书 ``valid_until``；
+    5. 候选不可确认时，沿**证书与溯源边的有效期边界**继续寻找最早
+       可确认时段（边界点为闭区间端点，即使落在占用段起点也单独重验；
+       闭区间交接点不合格则从其后一个整秒继续）。响应中的证书、截止
+       （``traceability_at`` / ``certificate_id`` /
+       ``certificate_valid_until``）与 ``trace_report`` 均对应**实际
+       建议起点**（无建议时为最后重验的候选起点）；
+    6. 全窗无物理空档 -> ``NO_FREE_SLOT_IN_WINDOW``；全部候选均越证
+       书截止且无换新链 -> ``CERTIFICATE_DEADLINE_TOO_EARLY``；边界
+       逐点重验后仍存在结构性不可确认候选（无有效证书以外的链失效）
+       -> ``NO_CONFIRMABLE_SLOT_IN_WINDOW``（``chain_reason_code``
+       给出细分原因）。``busy`` / ``maintenance_windows`` 始终覆盖整个
+       请求窗（搜索窗不再按单张证书截止裁剪）。
     """
     try:
         return booking.find_slots(db, instrument, start, end, duration_seconds)

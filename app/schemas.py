@@ -1017,9 +1017,13 @@ class CalibrationSlot(BaseModel):
 class CalibrationSlotsOut(BaseModel):
     """GET /api/calibration-slots 响应。
 
-    链不可用、窗内放不下或无空档时 ``slot`` 为 null 并给出
-    ``reason_code`` / ``reason``；``trace_report`` 为查询起点该仪器
-    的完整溯源校验报告（链不可用时据此说明原因）。
+    物理空档按预约与生效维护窗口的半开占用贪心求出；每个候选起点都
+    重放与预约确认相同的门禁（该时点唯一有效链 + 起点证书截止），
+    候选不可确认时沿证书/溯源边有效期边界继续寻找。链在查询起点即不
+    可用、窗内无物理空档或无任何候选可确认时 ``slot`` 为 null 并给出
+    ``reason_code`` / ``reason``；``trace_report``、``certificate_id``
+    与 ``certificate_valid_until`` 均对应**实际建议起点**（无建议时
+    为最后一次重验的候选起点；查询起点链即不可用时为查询起点）。
     """
 
     instrument: str
@@ -1027,57 +1031,81 @@ class CalibrationSlotsOut(BaseModel):
     window_end: datetime = Field(..., description="请求的查询窗终点（UTC）")
     duration_seconds: int
     traceability_at: datetime = Field(
-        ..., description="溯源链判定时点（UTC，取查询窗起点）"
+        ...,
+        description=(
+            "溯源链判定时点（UTC）：有建议时为实际建议起点；无建议时为"
+            "最后一次重验的候选起点；查询起点链即不可用时为查询窗起点"
+        ),
     )
     traceability_available: bool = Field(
-        ..., description="查询起点是否存在唯一且校验通过的溯源链"
+        ...,
+        description=(
+            "证据时点（traceability_at）是否存在唯一且校验通过的溯源链；"
+            "结构性不可确认终态（链断裂/多候选等）为 false"
+        ),
     )
     reason_code: Optional[str] = Field(
         None,
         description=(
-            "无空档原因：TRACEABILITY_CHAIN_UNAVAILABLE | "
-            "WINDOW_TOO_SHORT_FOR_DURATION | NO_FREE_SLOT_IN_WINDOW | "
-            "CERTIFICATE_DEADLINE_TOO_EARLY；有时段时为 null"
+            "无空档原因：TRACEABILITY_CHAIN_UNAVAILABLE（查询起点链即"
+            "不可用）| WINDOW_TOO_SHORT_FOR_DURATION | "
+            "NO_FREE_SLOT_IN_WINDOW（链可用但窗内无物理空档）| "
+            "CERTIFICATE_DEADLINE_TOO_EARLY（全部物理候选均无法在其当时"
+            "起点证书到期前结束）| NO_CONFIRMABLE_SLOT_IN_WINDOW（沿证书/"
+            "溯源边有效期边界逐点重验后仍有结构性不可确认候选）；"
+            "有时段时为 null"
         ),
     )
     reason: Optional[str] = Field(None, description="中文原因说明")
     chain_reason_code: Optional[str] = Field(
         None,
         description=(
-            "溯源链不可用的细分原因：NO_ACTIVE_CERTIFICATE | "
+            "证据时点溯源链不可用的细分原因：NO_ACTIVE_CERTIFICATE | "
             "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
             "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
-            "RESULT_UNDETERMINED（枚举截断、结果未定，预约链路门禁拒绝）"
+            "RESULT_UNDETERMINED（枚举截断、结果未定，预约链路门禁拒绝）；"
+            "仅 TRACEABILITY_CHAIN_UNAVAILABLE / NO_CONFIRMABLE_SLOT_IN_WINDOW "
+            "终态下可能非 null"
         ),
     )
     certificate_id: Optional[str] = Field(
-        None, description="唯一有效链的起点证书 id（链不可用时为 null）"
+        None,
+        description=(
+            "证据时点唯一有效链的起点证书 id（证据时点链不可用时为 null）"
+        ),
     )
     certificate_valid_until: Optional[datetime] = Field(
-        None, description="起点证书有效期截止（预约须在此之前结束）"
+        None, description="证据时点起点证书有效期截止（预约须在此之前结束）"
     )
     search_window_start: datetime = Field(
-        ..., description="实际搜索窗起点（UTC，等于请求窗起点）"
+        ...,
+        description=(
+            "实际搜索覆盖起点（UTC，有建议时为实际建议起点，否则为查询起点）"
+        ),
     )
     search_window_end: datetime = Field(
-        ..., description="实际搜索窗终点（UTC，受证书截止裁剪）"
+        ..., description="实际搜索窗终点（UTC，恒等于请求窗终点——不再按单张证书截止裁剪）"
     )
     slot: Optional[CalibrationSlot] = Field(
-        None, description="时间窗内最早可用时段；不存在时为 null"
+        None, description="时间窗内最早可确认时段（半开）；不存在时为 null"
     )
     busy: List[SlotBusyBooking] = Field(
         default_factory=list,
-        description="与搜索窗（半开）相交的既有预约，按起点升序",
+        description="与请求查询窗（半开）相交的既有预约，按起点升序",
     )
     maintenance_windows: List[SlotMaintenanceWindow] = Field(
         default_factory=list,
         description=(
-            "与搜索窗（半开）相交的生效中维护封锁窗口，按起点升序；"
+            "与请求查询窗（半开）相交的生效中维护封锁窗口，按起点升序；"
             "维护窗口与预约一并视作工位占用"
         ),
     )
     trace_report: dict = Field(
-        ..., description="查询起点该仪器的完整溯源校验报告（结构同 /api/reports）"
+        ...,
+        description=(
+            "证据时点（实际建议起点 / 最后重验候选 / 查询起点）的完整溯源"
+            "校验报告（结构同 /api/reports）"
+        ),
     )
 
 

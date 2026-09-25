@@ -952,6 +952,8 @@ def unique_chain_gate(
     conn: sqlite3.Connection,
     instrument_code: str,
     at: Optional[datetime] = None,
+    *,
+    cat: Optional[Catalog] = None,
 ) -> dict[str, Any]:
     """在指定时点要求该仪器存在“唯一且校验通过”的溯源链。
 
@@ -961,10 +963,15 @@ def unique_chain_gate(
     （仪器存在但无有效起点/起点不唯一/多候选/断裂/校验失败）
     返回 ``(reason_code, reason, report)``，由调用方向用户说明原因。
     仪器不存在由调用方（KeyError）自行处理为 404。
+
+    ``cat`` 可传入预装载的 :class:`Catalog`（同一查询内需对多个候选
+    起点反复重验链门禁时复用，避免每次重跑全库装载）；缺省时现场
+    从连接装载。
     """
     at_naive = to_utc_naive(at) if at else datetime.utcnow()
     at_s = fmt(at_naive)
-    cat = Catalog(conn)
+    if cat is None:
+        cat = Catalog(conn)
     if instrument_code not in cat.instruments:
         raise KeyError(instrument_code)
 

@@ -17,11 +17,16 @@
 
 ## 一、一键启动（Docker Compose）
 
+只需一条命令（构建镜像、安装 `requirements.txt` 依赖、容器启动时自动建库，
+库为空则按 `SEED_DEMO` 播种演示数据；服务监听 **8000** 端口）：
+
 ```bash
 docker compose up -d --build
 ```
 
-服务地址：
+API 统一通过宿主机 **8000** 端口访问（`docker-compose.yml` 把容器
+`8000` 映射到宿主机 `8000`；`Dockerfile` 的 `CMD` 即
+`uvicorn app.main:app --host 0.0.0.0 --port 8000`）：
 
 | 用途 | 地址 |
 | --- | --- |
@@ -31,16 +36,25 @@ docker compose up -d --build
 | OpenAPI Schema | http://localhost:8000/openapi.json |
 | 健康检查 | http://localhost:8000/health |
 
-- SQLite 数据文件持久化在 Docker 卷 `trace-data`（容器内 `/data/traceability.db`）。
-- 首次启动且数据库为空时自动写入演示数据（5 个场景，见第六节）。
-  不需要演示数据时，将 `docker-compose.yml` 中的 `SEED_DEMO` 改为 `"0"`。
+**必要配置（环境变量，均有缺省值，docker-compose.yml 已显式给出）：**
+
+| 变量 | 缺省值 | 说明 |
+| --- | --- | --- |
+| `TRACE_DB_PATH` | `/data/traceability.db`（容器内） | SQLite 数据文件路径；父目录不存在会自动创建 |
+| `SEED_DEMO` | `1`（Dockerfile/Compose） | `1`：启动且库为空时自动写入演示数据（5 个场景，见第六节）；`0`：不播种 |
+
+- 容器**启动即自动建库**（`CREATE TABLE IF NOT EXISTS …`，幂等），无需
+  手工初始化；SQLite 数据文件持久化在 Docker 卷 `trace-data`
+  （容器内 `/data/traceability.db`）。
+- 不需要演示数据时，将 `docker-compose.yml` 中的 `SEED_DEMO` 改为 `"0"`。
 - 修改代码后重建：`docker compose up -d --build`；清空数据：`docker compose down -v`。
 
-仅用 Docker 运行：
+仅用 Docker 运行（等价的一条启动命令，同样监听 8000）：
 
 ```bash
-docker build -t metrological-traceability-api .
-docker run -p 8000:8000 -e SEED_DEMO=1 -v trace-data:/data metrological-traceability-api
+docker build -t metrological-traceability-api . && \
+docker run --rm -p 8000:8000 -e SEED_DEMO=1 -v trace-data:/data \
+  metrological-traceability-api
 ```
 
 容器启动后可用健康检查与批量提交预检（dry-run，不写库）快速验证部署：
@@ -56,11 +70,13 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 
 ## 二、本地开发运行（无 Docker）
 
+依赖安装、启动建库与端口均与容器内一致（uvicorn 监听 8000）：
+
 ```bash
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（205 个用例）
+pytest -q        # 运行测试（211 个用例）
 ```
 
 本地服务监听 **http://localhost:8000**（与 Docker Compose 映射端口一致）：
@@ -166,7 +182,7 @@ station_maintenance_windows（校准工位维护封锁；UTC 半开区间，与�
 | **GET** | **`/api/trace/{instrument}?at=`** | **链路查询：重建唯一证书链** |
 | **GET** | **`/api/reports/{instrument}?at=`** | **校验报告（冲突明细）** |
 | **GET** | **`/api/coverage/{instrument}?start=&end=`** | **仪器时间窗覆盖查询：按有效期边界输出状态区段** |
-| **GET** | **`/api/calibration-slots?instrument=&start=&end=&duration_seconds=`** | **校准工位空档查询：单工位半开占用，返回时间窗内最早可用时段** |
+| **GET** | **`/api/calibration-slots?instrument=&start=&end=&duration_seconds=`** | **校准工位空档查询：单工位半开占用，候选起点重验唯一链与证书截止、沿有效期边界寻找最早可确认时段** |
 | **POST** | **`/api/calibration-bookings`** | **确认校准工位预约（同一写事务内重查占用与证书截止，冲突 409）** |
 | **POST** | **`/api/calibration-bookings/reschedule`** | **批量改期 2～10 条已有预约（同一写事务核验，冲突 409 整体回滚）** |
 | **GET** | **`/api/calibration-bookings?instrument=`** | **预约列表（可按仪器筛选）** |
@@ -487,20 +503,36 @@ curl -G "http://localhost:8000/api/calibration-slots" \
 
 服务端：
 
-1. 在**查询起点**判定该仪器是否存在**唯一且校验通过**的溯源链
-   （复用 `/api/reports` 同一引擎：`resolution=unique` 且零 ERROR 才放行，
-   多候选链绝不任取一条；枚举截断导致**结果未定**（`undetermined`）时
-   同样拒绝）。链不可用（无有效证书 / 起点不唯一 / 多候选 /
-   断裂 / 结果未定 / 校验失败）时 `slot=null`，
+1. 在**查询起点**判定该仪器是否存在**唯一且校验通过**的溯源链——这是
+   入口门禁（复用 `/api/reports` 同一引擎：`resolution=unique` 且零 ERROR
+   才放行，多候选链绝不任取一条；枚举截断导致**结果未定**（`undetermined`）
+   时同样拒绝）。查询起点链不可用时 `slot=null`，
    `reason_code=TRACEABILITY_CHAIN_UNAVAILABLE`，
    `chain_reason_code` 给出细分原因，完整证据见响应内的 `trace_report`；
-2. 预约必须在该**唯一有效链起点证书到期前结束**（`end <= valid_until`），
-   搜索窗右端按证书截止裁剪（`search_window_end`），到期前放不下时
-   `reason_code=CERTIFICATE_DEADLINE_TOO_EARLY`；
-3. 用与搜索窗半开相交的既有预约（`busy`，单工位、不分仪器）与
-   **生效中维护封锁窗口**（`maintenance_windows`，两者一并视作占用）
-   贪心求**最早**能容纳所需时长的空档；窗内放不下时
-   `reason_code=NO_FREE_SLOT_IN_WINDOW`（查询窗本身短于时长返回 422）。
+2. 用与**整个请求查询窗**半开相交的既有预约（`busy`，单工位、不分仪器）
+   与**生效中维护封锁窗口**（`maintenance_windows`，两者一并视作占用）
+   贪心求物理最早空档；**搜索窗不再按查询起点证书的截止裁剪**；
+3. **对每个候选起点重放与预约确认相同的门禁**：工位占用把建议起点推后后，
+   **绝不沿用查询起点的旧溯源结论**——在候选起点重新要求唯一有效链，且
+   候选结束（半开，`end == valid_until` 允许）不晚于**该候选起点**的起点
+   证书 `valid_until`。因此占用推后到换新证书生效后的候选，只要新证书在
+   新起点构成唯一有效链、截止充足，仍可给出建议时段；
+4. 候选不可确认时，沿**证书与溯源边的有效期边界**继续寻找最早可确认时段：
+   边界是闭区间端点，即使落在占用段起点、物理空档在忙段结束处，边界点本身
+   也会单独重验；**闭区间交接点**（前证 `valid_until == 后证 valid_from`
+   的整秒点，两证同时有效、常为起点不唯一）不合格时，从其后一个整秒
+   （边界 +1s）继续——闭区间交接点必须重验，不得由两侧开区间状态推断；
+5. 响应中的溯源说明（`traceability_at` / `certificate_id` /
+   `certificate_valid_until` / `trace_report`）均对应**实际建议起点**
+   （无建议时为最后一次重验的候选起点；查询起点链即不可用时为查询起点）。
+   全窗无合格时段时 `slot=null` 并给出具体原因码：
+
+   - `NO_FREE_SLOT_IN_WINDOW`：入口链成立，但窗内连可容纳时长的物理空档都没有；
+   - `CERTIFICATE_DEADLINE_TOO_EARLY`：全部物理候选均无法在其**当时**起点
+     证书到期前结束，且越过截止后无换新链（仅无证书空档）；
+   - `NO_CONFIRMABLE_SLOT_IN_WINDOW`：沿证书/溯源边有效期边界（含闭区间
+     交接点）逐点重验后，仍有结构性不可确认候选（起点不唯一/多候选/断裂/
+     校验失败/结果未定），`chain_reason_code` 给出最后候选的细分原因。
 
 ```jsonc
 {
@@ -508,21 +540,30 @@ curl -G "http://localhost:8000/api/calibration-slots" \
   "window_start": "2026-06-20T00:00:00Z",
   "window_end": "2026-06-21T00:00:00Z",
   "duration_seconds": 3600,
-  "traceability_at": "2026-06-20T00:00:00Z",   // 链判定时点（= 查询起点）
+  "traceability_at": "2026-06-20T00:00:00Z",   // 溯源判定时点：实际建议起点
   "traceability_available": true,
-  "certificate_id": "CW1-1",                   // 唯一有效链的起点证书
+  "certificate_id": "CW1-1",                   // 实际建议起点的唯一有效链起点证书
   "certificate_valid_until": "2027-01-01T00:00:00Z",
   "search_window_start": "2026-06-20T00:00:00Z",
-  "search_window_end": "2026-06-21T00:00:00Z", // 受证书截止裁剪后的实际搜索右端
-  "slot": {                                     // 最早可用时段（半开）
+  "search_window_end": "2026-06-21T00:00:00Z", // 恒为请求窗终点（不再按证书截止裁剪）
+  "slot": {                                     // 最早可确认时段（半开）
     "start": "2026-06-20T00:00:00Z",
     "end": "2026-06-20T01:00:00Z",
     "ends_by_certificate_valid_until": true
   },
-  "busy": [ /* 与搜索窗半开相交的既有预约：booking_id/instrument_code/start_at/end_at */ ],
-  "trace_report": { /* 查询起点的完整溯源报告，结构同 /api/reports，便于解释原因 */ }
+  "busy": [ /* 与整个请求窗（半开）相交的既有预约：booking_id/instrument_code/start_at/end_at */ ],
+  "maintenance_windows": [ /* 与请求窗半开相交的生效维护封锁，同样占用工位 */ ],
+  "trace_report": { /* 实际建议起点的完整溯源报告，结构同 /api/reports */ }
 }
 ```
+
+> 若 09:00~10:00 的占用把建议起点推后到 10:00，而该仪器旧证恰在 10:00
+> 到期、新证 10:00 起换发（两证闭区间首尾相接），则：10:00 交接点两证
+> 同时有效（起点不唯一）会被单独重验并拒绝，从 10:00:01 起以**新证**
+> 重验唯一链与截止，最早可确认时段从 10:00:01 开始，响应的
+> `certificate_id` / `certificate_valid_until` / `trace_report` 全部对应
+> 10:00:01 的新证结论——不会沿用 09:00 查询起点的旧证结果返回一个确认时
+> 必被 409 拒绝的时段。
 
 > 演示库已预置一条 `INST-W1` 在 `2026-06-20T09:00:00Z ~ 10:00:00Z` 的占用，
 > 用 `start=...T09:00:00Z` 查询可看到空档被它推后到 `10:00:00Z`（半开相接）。
@@ -1585,9 +1626,17 @@ curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
    最近共同证书，并从各链截取到该证书（含）为止的子链与距离；交集为空时
    明确返回无共同证书。全程不写入业务数据。
 9. 校准工位预约：全实验室单个工位，占用按半开区间 `[start, end)` 计算。
-   GET 在查询起点复用步骤 1~5 要求“唯一成链且零 ERROR”，取起点证书
-   `valid_until` 作为预约必须结束的截止并裁剪搜索窗，再以与搜索窗
-   半开相交的既有预约（不分仪器）贪心求最早可容纳所需时长的空档。
+   GET 先在查询起点复用步骤 1~5 要求“唯一成链且零 ERROR”作为入口门禁，
+   再把与整个请求窗半开相交的既有预约与生效中维护封锁窗口合并为工位
+   占用，贪心求物理最早空档；**对每个候选起点重放与确认相同的门禁**
+   （候选起点重新要求唯一成链、候选结束不晚于该起点证书 `valid_until`），
+   占用把建议起点推后后绝不沿用查询起点的旧溯源结论；候选不可确认时沿
+   证书与溯源边的有效期边界继续寻找——边界为闭区间端点，即使落在占用段
+   起点也单独重验，闭区间交接点（两证同时有效）不合格则从其后一个整秒
+   继续；全窗无合格时段按
+   `NO_FREE_SLOT_IN_WINDOW / CERTIFICATE_DEADLINE_TOO_EARLY /
+   NO_CONFIRMABLE_SLOT_IN_WINDOW` 给出空建议与具体原因，响应的证书、
+   截止与溯源报告对应实际建议起点（无建议时为最后重验候选）。
    POST 在 `BEGIN IMMEDIATE` 同一写事务内重查仪器、溯源链、证书截止与
    半开占用，任一不满足即 409 回滚，全部满足才原子写入；因此并发确认
    同一时段恰有一个成功，不产生重叠预约。批量改期（reschedule）同样在
