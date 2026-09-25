@@ -5,13 +5,17 @@
 * 全实验室只有**单个校准工位**：所有仪器的预约共用同一份占用表，
   占用一律按半开区间 ``[start_at, end_at)`` 计算——相接但不重叠的两段
   （如 ``[09:00,10:00)`` 与 ``[10:00,11:00)``）不冲突，可首尾相接预约。
-* 预约必须在查询起点（GET 用窗口起点、POST 用预约起点）该仪器
+* 预约必须在其起点（GET 为候选时段起点、POST 为预约起点）该仪器
   **唯一有效溯源链的起点证书到期前结束**，即
   ``end_at <= 起点证书 valid_until``。链不唯一 / 断裂 / 校验失败时
   复用溯源引擎给出可解释原因，绝不任取一条链。
-* ``GET`` 只读：返回时间窗内（受证书截止裁剪后）最早可容纳所需时长的
-  时段；``POST`` 在同一写事务内（``BEGIN IMMEDIATE``）重查占用与证书
-  截止，冲突返回 409，随后原子写入 SQLite。
+* ``GET`` 只读：查询起点链有效时，沿单工位半开占用（预约 + 生效维护
+  窗口）贪心推进候选起点，并在每个候选起点**重验**唯一有效链与起点
+  证书截止（不沿用查询起点结论）；候选沿证书与溯源边有效期边界
+  （闭区间交接点本身也要重验）继续寻找其后最早可确认时段，全窗无
+  合格时段时 ``slot=null`` 并给出具体原因。``POST`` 在同一写事务
+  （``BEGIN IMMEDIATE``）重查占用与证书截止，冲突返回 409，随后
+  原子写入 SQLite。
 * 批量改期（``reschedule_bookings``）：一次写事务内核对 2～10 条已有
   预约存在且 ID 不重复，将本批预约的旧占用整体排除后，再按半开区间
   检查新时段彼此及与其他预约的冲突（允许交换时段与首尾相接）；每条
@@ -47,7 +51,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from .crud import ValidationError, get_instrument
-from .engine import unique_chain_gate
+from .engine import Catalog, relevant_trace_boundaries, unique_chain_gate
 from .maintenance import overlapping_windows as _overlapping_maintenance
 from .utils import fmt, to_utc_naive, utcnow_str
 
@@ -246,28 +250,33 @@ def _raise_if_maintenance(
 
 # ---------------------------------------------------------------- 最早空档
 
-def _earliest_slot(
-    busy: list[tuple[datetime, datetime]],
-    cursor: datetime,
-    window_end: datetime,
-    duration: timedelta,
-) -> Optional[tuple[datetime, datetime]]:
-    """在 ``[cursor, window_end]`` 内求最早能容纳 duration 的半开空档。
+def _merge_intervals(
+    intervals: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """把可能重叠/相接的半开占用段合并为互不相交、按起点升序的并集段。"""
+    if not intervals:
+        return []
+    ordered = sorted(intervals, key=lambda iv: (iv[0], iv[1]))
+    merged: list[list[datetime]] = [list(ordered[0])]
+    for s, e in ordered[1:]:
+        if s <= merged[-1][1]:  # 半开重叠或相接：并入当前并集段
+            if e > merged[-1][1]:
+                merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
 
-    贪心法：游标取窗口起点，依次与按开始时间排序的占用段比较，
-    若 ``[cursor, cursor+duration]`` 不与当前段相交则即为答案，
-    否则游标跳到当前段结束（半开，可与占用段首尾相接）。
-    """
+
+def _busy_end_at(
+    busy: list[tuple[datetime, datetime]], cursor: datetime
+) -> Optional[datetime]:
+    """游标落在（或早于）哪个占用段内时，返回该并集段结束点；否则 None。"""
     for b_start, b_end in busy:
         if b_end <= cursor:
-            continue  # 占用段完全在游标之前
-        if cursor + duration <= b_start:
-            break  # 段开始前放得下（半开：candidate_end == b_start 不冲突）
-        if b_end > cursor:
-            cursor = b_end  # 被该段占用，游标跳到其结束（可相接）
-    candidate_end = cursor + duration
-    if candidate_end <= window_end:
-        return cursor, candidate_end
+            continue
+        if cursor < b_start:
+            return None  # busy 已按起点升序，后续段更晚
+        return b_end
     return None
 
 
@@ -278,7 +287,18 @@ def find_slots(
     end: datetime,
     duration_seconds: int,
 ) -> dict[str, Any]:
-    """GET /api/calibration-slots 的只读计算。"""
+    """GET /api/calibration-slots 的只读计算。
+
+    查询起点链不可用时直接说明原因；查询起点链有效时，沿单工位半开占用
+    （既有预约 + 生效维护窗口）贪心推进候选起点，并在**每个候选起点**
+    重新执行与确认预约相同的门禁：该时点唯一有效溯源链仍成立、且
+    ``candidate_end <= 该起点证书 valid_until``。证书与溯源边有效期是
+    闭区间、状态只在边界点及其后发生切换，故候选除查询起点与占用段
+    结束点外，还须评估窗内每张相关证书/每条溯源边的有效期边界
+    （边界点本身按闭区间重验，边界之后取 +1s 代表开区间状态）。
+    这样被占用推迟的建议起点若已跨过证书截止、证书断档/交接或边失效，
+    会继续沿边界寻找其后最早的可确认时段，而不是沿用查询起点的结论。
+    """
     if duration_seconds <= 0:
         raise ValidationError("所需时长 duration_seconds 必须为正整数秒")
     start_naive = to_utc_naive(start)
@@ -297,19 +317,24 @@ def find_slots(
     if get_instrument(conn, instrument_code) is None:
         raise KeyError(instrument_code)
 
-    # 1) 查询起点该仪器必须存在唯一且校验通过的溯源链
-    gate = unique_chain_gate(conn, instrument_code, start_naive)
-    if not gate["ok"]:
+    cat = Catalog(conn)
+
+    # 1) 查询起点该仪器必须存在唯一且校验通过的溯源链（沿用查询起点门禁：
+    #    起点链即不可用时不做后续空档搜索，直接给出链不可用原因）
+    first_gate = unique_chain_gate(
+        conn, instrument_code, start_naive, cat=cat
+    )
+    if not first_gate["ok"]:
         return {
             "instrument": instrument_code,
             "window_start": lo_s,
             "window_end": hi_s,
             "duration_seconds": duration_seconds,
-            "traceability_at": gate["at"],
+            "traceability_at": first_gate["at"],
             "traceability_available": False,
             "reason_code": REASON_CHAIN_UNAVAILABLE,
-            "reason": gate["reason"],
-            "chain_reason_code": gate["reason_code"],
+            "reason": first_gate["reason"],
+            "chain_reason_code": first_gate["reason_code"],
             "certificate_id": None,
             "certificate_valid_until": None,
             "search_window_start": lo_s,
@@ -317,22 +342,88 @@ def find_slots(
             "slot": None,
             "busy": [],
             "maintenance_windows": [],
-            "trace_report": gate["report"],
+            "trace_report": first_gate["report"],
         }
 
-    cert_id = gate["start_certificate_id"]
-    deadline_s = gate["certificate_valid_until"]
-    deadline = _parse(deadline_s)
+    # 2) 全窗单工位占用（与半开查询窗相交的既有预约 + 生效维护窗口）
+    rows = _overlapping_bookings(conn, lo_s, hi_s)
+    mrows = _overlapping_maintenance(conn, lo_s, hi_s)
+    busy_intervals = _merge_intervals(
+        [(_parse(r["start_at"]), _parse(r["end_at"])) for r in rows]
+        + [(_parse(r["start_at"]), _parse(r["end_at"])) for r in mrows]
+    )
 
-    # 2) 预约须在起点证书到期前（含到期瞬间）结束：裁剪搜索窗右端
-    search_end = min(end_naive, deadline)
-    search_end_s = fmt(search_end)
-    if start_naive + duration > search_end:
-        reason_code = (
-            REASON_DEADLINE_TOO_EARLY
-            if search_end_s < hi_s
-            else REASON_WINDOW_TOO_SHORT
-        )
+    # 3) 候选起点集合：查询起点、占用段结束点、窗内相关证书/溯源边的
+    #    有效期边界点（闭区间交接点须重验）及其后 +1s（边界之后的开
+    #    区间状态）。全部落在查询窗内、升序去重后逐一评估。
+    boundary_ts = relevant_trace_boundaries(
+        conn, instrument_code, start_naive, end_naive, cat=cat
+    )
+    candidates: set[datetime] = {start_naive}
+    for _b_start, b_end in busy_intervals:
+        if start_naive < b_end < end_naive:
+            candidates.add(b_end)
+    one_second = timedelta(seconds=1)
+    for boundary in boundary_ts:
+        if start_naive <= boundary < end_naive:
+            candidates.add(boundary)
+        after = boundary + one_second
+        if start_naive < after < end_naive:
+            candidates.add(after)
+    ordered_candidates = sorted(candidates)
+
+    # 4) 沿候选推进：被占用覆盖则跳到占用段结束（已在候选集中）；
+    #    不被占用但放不下整段时长的候选直接跳过；其余候选在候选起点
+    #    重验唯一有效链与起点证书截止，最早通过者即为答案。
+    blockers: list[dict[str, Any]] = []
+    found: Optional[tuple[datetime, datetime, dict[str, Any]]] = None
+    saw_fitting_candidate = False  # 是否出现过“不被占用且容得下时长”的候选
+
+    for cand in ordered_candidates:
+        busy_end = _busy_end_at(busy_intervals, cand)
+        if busy_end is not None:
+            continue  # 该候选落在占用段内：跳到其结束点（另一候选）继续
+        cand_end = cand + duration
+        if cand_end > end_naive:
+            continue  # 占用后剩余窗长不足：该候选放不下
+        saw_fitting_candidate = True
+
+        gate = unique_chain_gate(conn, instrument_code, cand, cat=cat)
+        if not gate["ok"]:
+            blockers.append({"kind": "chain", "at": cand, "gate": gate})
+            continue
+        deadline_s = gate["certificate_valid_until"]
+        if cand_end > _parse(deadline_s):
+            blockers.append({"kind": "deadline", "at": cand, "gate": gate})
+            continue
+
+        found = (cand, cand_end, gate)
+        break
+
+    # 5) 组装响应。证书/截止/溯源说明一律对应实际建议起点（无建议时
+    #    对应最早阻断候选的门禁；连可放候选都没有则回退查询起点门禁）。
+    busy_out = [
+        {
+            "booking_id": r["id"],
+            "instrument_code": r["instrument_code"],
+            "start_at": r["start_at"],
+            "end_at": r["end_at"],
+        }
+        for r in rows
+    ]
+    maintenance_out = [
+        {
+            "maintenance_window_id": r["id"],
+            "start_at": r["start_at"],
+            "end_at": r["end_at"],
+            "reason": r["reason"],
+        }
+        for r in mrows
+    ]
+
+    if found is not None:
+        s_start, s_end, gate = found
+        deadline_s = gate["certificate_valid_until"]
         return {
             "instrument": instrument_code,
             "window_start": lo_s,
@@ -340,86 +431,109 @@ def find_slots(
             "duration_seconds": duration_seconds,
             "traceability_at": gate["at"],
             "traceability_available": True,
-            "reason_code": reason_code,
-            "reason": (
-                f"仪器 {instrument_code} 唯一有效溯源链的起点证书 {cert_id} "
-                f"于 {deadline_s} 到期，预约（{duration_seconds}s）无法在到期前结束"
-                if reason_code == REASON_DEADLINE_TOO_EARLY
-                else f"查询窗内不存在可容纳 {duration_seconds}s 的时段"
-            ),
+            "reason_code": None,
+            "reason": None,
             "chain_reason_code": None,
-            "certificate_id": cert_id,
+            "certificate_id": gate["start_certificate_id"],
             "certificate_valid_until": deadline_s,
             "search_window_start": lo_s,
-            "search_window_end": search_end_s,
-            "slot": None,
-            "busy": [],
-            "maintenance_windows": [],
-            "trace_report": gate["report"],
-        }
-
-    # 3) 单工位占用（与半开搜索窗相交的既有预约 + 生效中维护窗口），
-    #    两者一并视作占用，求最早空档
-    rows = _overlapping_bookings(conn, lo_s, search_end_s)
-    mrows = _overlapping_maintenance(conn, lo_s, search_end_s)
-    busy = [(_parse(r["start_at"]), _parse(r["end_at"])) for r in rows]
-    busy += [(_parse(r["start_at"]), _parse(r["end_at"])) for r in mrows]
-    busy.sort(key=lambda iv: (iv[0], iv[1]))
-    found = _earliest_slot(busy, start_naive, search_end, duration)
-
-    result: dict[str, Any] = {
-        "instrument": instrument_code,
-        "window_start": lo_s,
-        "window_end": hi_s,
-        "duration_seconds": duration_seconds,
-        "traceability_at": gate["at"],
-        "traceability_available": True,
-        "chain_reason_code": None,
-        "certificate_id": cert_id,
-        "certificate_valid_until": deadline_s,
-        "search_window_start": lo_s,
-        "search_window_end": search_end_s,
-        "busy": [
-            {
-                "booking_id": r["id"],
-                "instrument_code": r["instrument_code"],
-                "start_at": r["start_at"],
-                "end_at": r["end_at"],
-            }
-            for r in rows
-        ],
-        "maintenance_windows": [
-            {
-                "maintenance_window_id": r["id"],
-                "start_at": r["start_at"],
-                "end_at": r["end_at"],
-                "reason": r["reason"],
-            }
-            for r in mrows
-        ],
-        "trace_report": gate["report"],
-    }
-    if found is None:
-        result.update(
-            reason_code=REASON_NO_FREE_SLOT,
-            reason=(
-                f"单个校准工位在 [{lo_s}, {search_end_s}) 内不存在可容纳 "
-                f"{duration_seconds}s 的空档（占用按半开区间计算）"
-            ),
-            slot=None,
-        )
-    else:
-        s_start, s_end = found
-        result.update(
-            reason_code=None,
-            reason=None,
-            slot={
+            "search_window_end": hi_s,
+            "slot": {
                 "start": fmt(s_start),
                 "end": fmt(s_end),
                 "ends_by_certificate_valid_until": fmt(s_end) <= deadline_s,
             },
+            "busy": busy_out,
+            "maintenance_windows": maintenance_out,
+            "trace_report": gate["report"],
+        }
+
+    if not saw_fitting_candidate:
+        # 窗内每个候选要么落在占用段内、要么其后放不下所需时长：
+        # 纯工位占用原因（即便起点证书很早到期，证书也不是阻断因素）
+        blocker_gate = blockers[0]["gate"] if blockers else first_gate
+        cert_id = (
+            blocker_gate.get("start_certificate_id")
+            if blocker_gate["ok"]
+            else None
         )
-    return result
+        deadline_s = (
+            blocker_gate["certificate_valid_until"]
+            if blocker_gate["ok"]
+            else None
+        )
+        return {
+            "instrument": instrument_code,
+            "window_start": lo_s,
+            "window_end": hi_s,
+            "duration_seconds": duration_seconds,
+            "traceability_at": blocker_gate["at"],
+            "traceability_available": blocker_gate["ok"],
+            "reason_code": REASON_NO_FREE_SLOT,
+            "reason": (
+                f"单个校准工位在 [{lo_s}, {hi_s}) 内不存在可容纳 "
+                f"{duration_seconds}s 的空档（既有预约与生效维护封锁窗口"
+                "均按半开区间占用）"
+            ),
+            "chain_reason_code": (
+                None if blocker_gate["ok"] else blocker_gate["reason_code"]
+            ),
+            "certificate_id": cert_id,
+            "certificate_valid_until": deadline_s,
+            "search_window_start": lo_s,
+            "search_window_end": hi_s,
+            "slot": None,
+            "busy": busy_out,
+            "maintenance_windows": maintenance_out,
+            "trace_report": blocker_gate["report"],
+        }
+
+    # 有过放得下整段时长且不被占用的候选，但逐一被链不可用/证书截止
+    # 拒绝：取最早阻断候选（同时刻链阻断优先于截止阻断说明）作为结论
+    blockers.sort(key=lambda b: (b["at"], 0 if b["kind"] == "chain" else 1))
+    decisive = blockers[0]
+    gate = decisive["gate"]
+    at_s = gate["at"]
+    if decisive["kind"] == "chain":
+        reason_code = REASON_CHAIN_UNAVAILABLE
+        reason = (
+            f"工位空档候选起点 {at_s} 处，仪器 {instrument_code} 的唯一有效"
+            "溯源链不可用（" + gate["reason"] + "）；已沿工位占用与证书/"
+            "溯源边有效期边界继续搜索，窗内不存在可确认时段"
+        )
+        cert_id = None
+        deadline_s = None
+    else:
+        cert_id = gate["start_certificate_id"]
+        deadline_s = gate["certificate_valid_until"]
+        reason_code = REASON_DEADLINE_TOO_EARLY
+        reason = (
+            f"工位空档候选起点 {at_s} 处，仪器 {instrument_code} 唯一有效"
+            f"溯源链的起点证书 {cert_id} 于 {deadline_s} 到期，"
+            f"预约（{duration_seconds}s）无法在到期前结束；已沿工位占用与"
+            "证书/溯源边有效期边界继续搜索，窗内不存在可确认时段"
+        )
+    return {
+        "instrument": instrument_code,
+        "window_start": lo_s,
+        "window_end": hi_s,
+        "duration_seconds": duration_seconds,
+        "traceability_at": at_s,
+        "traceability_available": gate["ok"],
+        "reason_code": reason_code,
+        "reason": reason,
+        "chain_reason_code": (
+            gate["reason_code"] if decisive["kind"] == "chain" else None
+        ),
+        "certificate_id": cert_id,
+        "certificate_valid_until": deadline_s,
+        "search_window_start": lo_s,
+        "search_window_end": hi_s,
+        "slot": None,
+        "busy": busy_out,
+        "maintenance_windows": maintenance_out,
+        "trace_report": gate["report"],
+    }
 
 
 # ---------------------------------------------------------------- 预约确认

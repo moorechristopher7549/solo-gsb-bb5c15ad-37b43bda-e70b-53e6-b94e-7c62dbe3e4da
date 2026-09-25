@@ -1018,8 +1018,9 @@ class CalibrationSlotsOut(BaseModel):
     """GET /api/calibration-slots 响应。
 
     链不可用、窗内放不下或无空档时 ``slot`` 为 null 并给出
-    ``reason_code`` / ``reason``；``trace_report`` 为查询起点该仪器
-    的完整溯源校验报告（链不可用时据此说明原因）。
+    ``reason_code`` / ``reason``；``trace_report`` 为实际建议起点
+    （无建议时为最早阻断候选起点、查询起点链即不可用时为查询起点）
+    该仪器的完整溯源校验报告。
     """
 
     instrument: str
@@ -1027,17 +1028,27 @@ class CalibrationSlotsOut(BaseModel):
     window_end: datetime = Field(..., description="请求的查询窗终点（UTC）")
     duration_seconds: int
     traceability_at: datetime = Field(
-        ..., description="溯源链判定时点（UTC，取查询窗起点）"
+        ...,
+        description=(
+            "溯源链判定时点（UTC）：有建议时段时为建议时段起点；无建议时为"
+            "最早阻断候选起点（查询起点链即不可用时为查询窗起点）"
+        ),
     )
     traceability_available: bool = Field(
-        ..., description="查询起点是否存在唯一且校验通过的溯源链"
+        ...,
+        description=(
+            "溯源链判定时点是否存在唯一且校验通过的溯源链（对应实际建议/"
+            "阻断起点，而非恒为查询起点）"
+        ),
     )
     reason_code: Optional[str] = Field(
         None,
         description=(
-            "无空档原因：TRACEABILITY_CHAIN_UNAVAILABLE | "
-            "WINDOW_TOO_SHORT_FOR_DURATION | NO_FREE_SLOT_IN_WINDOW | "
-            "CERTIFICATE_DEADLINE_TOO_EARLY；有时段时为 null"
+            "无可确认时段原因：TRACEABILITY_CHAIN_UNAVAILABLE（查询起点或"
+            "被占用推迟后的候选起点链不可用）| "
+            "WINDOW_TOO_SHORT_FOR_DURATION | NO_FREE_SLOT_IN_WINDOW（占用排满）| "
+            "CERTIFICATE_DEADLINE_TOO_EARLY（候选起点证书截止不足）；"
+            "有可确认时段时为 null"
         ),
     )
     reason: Optional[str] = Field(None, description="中文原因说明")
@@ -1051,33 +1062,43 @@ class CalibrationSlotsOut(BaseModel):
         ),
     )
     certificate_id: Optional[str] = Field(
-        None, description="唯一有效链的起点证书 id（链不可用时为 null）"
+        None,
+        description=(
+            "实际建议起点唯一有效链的起点证书 id（链不可用时为 null）"
+        ),
     )
     certificate_valid_until: Optional[datetime] = Field(
-        None, description="起点证书有效期截止（预约须在此之前结束）"
+        None, description="实际建议起点证书的有效期截止（预约须在此之前结束）"
     )
     search_window_start: datetime = Field(
         ..., description="实际搜索窗起点（UTC，等于请求窗起点）"
     )
     search_window_end: datetime = Field(
-        ..., description="实际搜索窗终点（UTC，受证书截止裁剪）"
+        ...,
+        description=(
+            "实际搜索窗终点（UTC，等于请求窗终点；不再按查询起点证书截止"
+            "预裁剪——候选起点逐点重验截止，可跨过证书续期交接找到后续时段）"
+        ),
     )
     slot: Optional[CalibrationSlot] = Field(
-        None, description="时间窗内最早可用时段；不存在时为 null"
+        None, description="时间窗内最早可确认时段；不存在时为 null"
     )
     busy: List[SlotBusyBooking] = Field(
         default_factory=list,
-        description="与搜索窗（半开）相交的既有预约，按起点升序",
+        description="与查询窗（半开）相交的既有预约，按起点升序",
     )
     maintenance_windows: List[SlotMaintenanceWindow] = Field(
         default_factory=list,
         description=(
-            "与搜索窗（半开）相交的生效中维护封锁窗口，按起点升序；"
+            "与查询窗（半开）相交的生效中维护封锁窗口，按起点升序；"
             "维护窗口与预约一并视作工位占用"
         ),
     )
     trace_report: dict = Field(
-        ..., description="查询起点该仪器的完整溯源校验报告（结构同 /api/reports）"
+        ...,
+        description=(
+            "实际建议/阻断起点该仪器的完整溯源校验报告（结构同 /api/reports）"
+        ),
     )
 
 

@@ -952,6 +952,8 @@ def unique_chain_gate(
     conn: sqlite3.Connection,
     instrument_code: str,
     at: Optional[datetime] = None,
+    *,
+    cat: Optional[Catalog] = None,
 ) -> dict[str, Any]:
     """在指定时点要求该仪器存在“唯一且校验通过”的溯源链。
 
@@ -961,20 +963,38 @@ def unique_chain_gate(
     （仪器存在但无有效起点/起点不唯一/多候选/断裂/校验失败）
     返回 ``(reason_code, reason, report)``，由调用方向用户说明原因。
     仪器不存在由调用方（KeyError）自行处理为 404。
+
+    ``cat`` 可传入已装载的 :class:`Catalog` 快照（同一调用需在多个候选
+    时点反复评估时复用，避免重复全表装载）；``at`` 允许带小数秒——
+    证书/边有效期为整秒闭区间，小数秒点经 ``_GridKey`` 与整秒串保持真实
+    时间顺序比较（整秒边界本身仍按闭区间评估）。返回中的 ``at`` 为
+    内部比较键，``at_display`` 为规范 ISO 展示串（不带内部哨兵）。
     """
     at_naive = to_utc_naive(at) if at else datetime.utcnow()
-    at_s = fmt(at_naive)
-    cat = Catalog(conn)
+    at_key = _GridKey(at_naive)
+    at_s = str(at_key)  # 内部比较键（小数秒带哨兵，保证与整秒边界真实排序）
+    at_display = _display_ts(at_naive)  # 规范 ISO 展示串（不泄漏哨兵）
+    if cat is None:
+        cat = Catalog(conn)
     if instrument_code not in cat.instruments:
         raise KeyError(instrument_code)
 
     report = _build_report(cat, instrument_code, at_s)
-    rejection = _nonparticipation(instrument_code, report, at_s)
+    # 报告 at 与中文原因中的时点统一呈现为规范 ISO 串（小数秒冲突明细中
+    # 可能内嵌内部哨兵键，统一替换为展示串）
+    report["at"] = at_display
+    for issue in report.get("conflicts", []):
+        msg = issue.get("message")
+        if isinstance(msg, str) and at_s in msg:
+            issue["message"] = msg.replace(at_s, at_display)
+    rejection = _nonparticipation(instrument_code, report, at_display)
     if rejection is not None:
         reason_code, reason = rejection
         return {
             "ok": False,
-            "at": at_s,
+            "at": at_display,
+            "at_key": at_s,
+            "at_display": at_display,
             "reason_code": reason_code,
             "reason": reason,
             "report": report,
@@ -983,7 +1003,9 @@ def unique_chain_gate(
     start_cert_id = start_node["certificate_id"]
     return {
         "ok": True,
-        "at": at_s,
+        "at": at_display,
+        "at_key": at_s,
+        "at_display": at_display,
         "reason_code": None,
         "reason": None,
         "report": report,
@@ -1827,6 +1849,33 @@ def _collect_relevant_boundaries(
             clamp_add(e["valid_from"])
             clamp_add(e["valid_until"])
     return boundaries
+
+
+def relevant_trace_boundaries(
+    conn: sqlite3.Connection,
+    instrument_code: str,
+    lo: datetime,
+    hi: datetime,
+    *,
+    cat: Optional[Catalog] = None,
+) -> set[datetime]:
+    """暴露供空档搜索复用的相关溯源有效期边界（naive UTC 集合）。
+
+    收集范围与 :func:`_collect_relevant_boundaries` 相同：该仪器全部证书
+    沿“子→父”边闭包可达的全部证书与溯源边（含国家基准根证书），其
+    ``valid_from / valid_until`` 落在闭查询窗 ``[lo, hi]`` 内者。
+    证书/边有效性在边界点按闭区间判定，边界点之后的开区间状态恒定，
+    因此沿这些边界推进候选起点即可完整枚举溯源状态的每一次切换。
+
+    ``cat`` 可传入已装载的 :class:`Catalog` 快照以复用同一内存视图。
+    """
+    lo_naive = to_utc_naive(lo)
+    hi_naive = to_utc_naive(hi)
+    if cat is None:
+        cat = Catalog(conn)
+    if instrument_code not in cat.instruments:
+        raise KeyError(instrument_code)
+    return _collect_relevant_boundaries(cat, instrument_code, lo_naive, hi_naive)
 
 
 def _interior_moment(lo_dt: datetime, hi_dt: datetime) -> datetime:

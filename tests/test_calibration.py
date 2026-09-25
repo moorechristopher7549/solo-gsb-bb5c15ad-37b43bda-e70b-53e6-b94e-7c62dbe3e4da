@@ -9,6 +9,7 @@ _tmp.close()
 os.environ["TRACE_DB_PATH"] = _tmp.name
 os.environ["SEED_DEMO"] = "0"
 
+from app import booking as booking_svc  # noqa: E402
 from app.database import get_conn_ctx, init_db  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -149,7 +150,9 @@ def test_slot_no_free_returns_reason(client):
     assert "单个校准工位" in d["reason"]
 
 
-def test_slot_search_window_clipped_by_certificate_deadline(client):
+def test_slot_search_window_not_pre_clipped_by_certificate_deadline(client):
+    """搜索窗不再按查询起点证书截止预裁剪：搜索右端即请求窗终点，
+    截止规则改在候选起点逐点重验（本用例起点即放得下）。"""
     _chain(client, leaf_until="2026-06-20T12:00:00Z")
     # 查询窗远超起点证书到期时刻
     r = client.get("/api/calibration-slots", params={
@@ -159,7 +162,7 @@ def test_slot_search_window_clipped_by_certificate_deadline(client):
         "duration_seconds": 3600,
     })
     d = r.json()
-    assert d["search_window_end"] == "2026-06-20T12:00:00Z"
+    assert d["search_window_end"] == "2027-06-20T00:00:00Z"
     assert d["slot"]["end"] == "2026-06-20T01:00:00Z"
     assert d["slot"]["ends_by_certificate_valid_until"] is True
 
@@ -176,12 +179,16 @@ def test_slot_deadline_too_early(client):
     assert d["slot"] is None
     assert d["reason_code"] == "CERTIFICATE_DEADLINE_TOO_EARLY"
     assert "到期" in d["reason"]
-    assert d["search_window_end"] == "2026-06-20T10:30:00Z"
+    # 搜索窗不再预裁剪，但证书/截止/溯源说明对应最早阻断候选（=查询起点）
+    assert d["search_window_end"] == "2026-06-21T00:00:00Z"
+    assert d["traceability_at"] == "2026-06-20T10:00:00Z"
+    assert d["certificate_id"] == "CW-W"
+    assert d["certificate_valid_until"] == "2026-06-20T10:30:00Z"
 
 
 def test_slot_deadline_clips_otherwise_fitting_window(client):
-    """时长本在原窗内放得下，但裁剪到证书截止后放不下 -> 归因为截止过早，
-    而不是窗口过短。"""
+    """时长本在原窗内放得下，但候选起点证书截止前放不下 -> 归因为截止过早，
+    而不是窗口过短或工位占用。"""
     _chain(client, leaf_until="2026-06-20T10:30:00Z")
     r = client.get("/api/calibration-slots", params={
         "instrument": "W",
@@ -192,7 +199,8 @@ def test_slot_deadline_clips_otherwise_fitting_window(client):
     d = r.json()
     assert d["slot"] is None
     assert d["reason_code"] == "CERTIFICATE_DEADLINE_TOO_EARLY"
-    assert d["search_window_end"] == "2026-06-20T10:30:00Z"
+    assert d["search_window_end"] == "2026-06-21T00:00:00Z"
+    assert d["certificate_valid_until"] == "2026-06-20T10:30:00Z"
 
 
 def test_slot_exact_fit_to_deadline(client):
@@ -333,6 +341,243 @@ def test_slot_station_shared_across_instruments(client):
     # [09,10) 被另一台仪器占用 -> 最早 10:00
     assert d["slot"]["start"] == "2026-06-20T10:00:00Z"
     assert d["busy"][0]["instrument_code"] == "W2"
+
+
+# ---------------------------------------------------- 候选起点逐点重验
+
+def _submit_topology(client, leaf_certs, edges, *, extra_instruments=(),
+                     extra_certs=()):
+    """提交 基准 G / 参考 R / 工作仪器 W 的自定义证书与边拓扑。"""
+    instruments = [
+        {"code": "G", "name": "基准", "is_national_standard": True},
+        {"code": "R", "name": "参考器"},
+        {"code": "W", "name": "工作仪器"},
+        *extra_instruments,
+    ]
+    certs = [
+        {"id": "CG", "instrument_code": "G", "cert_number": "G1",
+         "issued_at": "2024-01-01T00:00:00",
+         "valid_from": "2024-01-01T00:00:00", "valid_until": "2031-01-01T00:00:00",
+         "uncertainty": 0.0001, "unit": "mm"},
+        {"id": "CR", "instrument_code": "R", "cert_number": "R1",
+         "issued_at": "2025-06-01T00:00:00",
+         "valid_from": "2025-06-01T00:00:00", "valid_until": "2030-01-01T00:00:00",
+         "uncertainty": 0.001, "unit": "mm"},
+        *leaf_certs,
+        *extra_certs,
+    ]
+    r = client.post("/api/submissions",
+                    json={"instruments": instruments, "certificates": certs,
+                          "edges": edges})
+    assert r.status_code == 201, r.text
+
+
+def _leaf(cid, valid_from, valid_until, *, issued_at="2026-01-02T00:00:00",
+          instrument="W"):
+    return {"id": cid, "instrument_code": instrument, "cert_number": cid,
+            "issued_at": issued_at,
+            "valid_from": valid_from, "valid_until": valid_until,
+            "uncertainty": 0.01, "unit": "mm"}
+
+
+def _seed_busy(start, end, *, instrument="W", cert="CW1"):
+    """绕过写事务门禁直接播种一条占用（历史预约可能在旧证书下确认）。"""
+    from datetime import datetime as _dt
+    with get_conn_ctx() as conn:
+        booking_svc.insert_booking(
+            conn,
+            instrument_code=instrument,
+            start_at=start,
+            end_at=end,
+            duration_seconds=int(
+                (_dt.strptime(end, "%Y-%m-%dT%H:%M:%SZ")
+                 - _dt.strptime(start, "%Y-%m-%dT%H:%M:%SZ")).total_seconds()
+            ),
+            certificate_id=cert,
+            certificate_valid_until="2027-01-01T00:00:00Z",
+        )
+
+
+def test_slot_revalidates_chain_after_occupancy_pushes_past_renewal(client):
+    """占用把建议起点推过证书闭区间续期交接点后，候选起点须重验链与
+    起点证书截止，响应证据对应新起点（修复前会沿用查询起点结论并因
+    旧证书截止错误地拒绝/裁剪）。"""
+    _submit_topology(
+        client,
+        [
+            _leaf("CW1", "2026-01-01T00:00:00Z", "2026-06-20T10:00:00Z"),
+            _leaf("CW2", "2026-06-20T10:00:00Z", "2027-06-01T00:00:00Z",
+                  issued_at="2026-06-01T00:00:00"),
+        ],
+        [
+            {"child_cert_id": "CW1", "parent_cert_id": "CR"},
+            {"child_cert_id": "CW2", "parent_cert_id": "CR"},
+            {"child_cert_id": "CR", "parent_cert_id": "CG"},
+        ],
+    )
+    # 占用 [09:00,10:30) 把候选推到 10:30（落在新证书 CW2 有效期内）
+    _seed_busy("2026-06-20T09:00:00Z", "2026-06-20T10:30:00Z", cert="CW1")
+
+    r = client.get("/api/calibration-slots", params={
+        "instrument": "W",
+        "start": "2026-06-20T09:00:00Z",
+        "end": "2026-06-20T12:00:00Z",
+        "duration_seconds": 1800,
+    })
+    d = r.json()
+    assert d["slot"] == {
+        "start": "2026-06-20T10:30:00Z",
+        "end": "2026-06-20T11:00:00Z",
+        "ends_by_certificate_valid_until": True,
+    }
+    # 证书/截止/溯源说明均对应实际建议起点（新证书 CW2），不是查询起点 CW1
+    assert d["traceability_at"] == "2026-06-20T10:30:00Z"
+    assert d["certificate_id"] == "CW2"
+    assert d["certificate_valid_until"] == "2027-06-01T00:00:00Z"
+    assert d["trace_report"]["at"] == "2026-06-20T10:30:00Z"
+    assert d["trace_report"]["starts"] == ["CW2"]
+    assert d["search_window_end"] == "2026-06-20T12:00:00Z"
+    # 建议时段经 POST 写事务重查同样可确认
+    rr = client.post("/api/calibration-bookings", json={
+        "instrument_code": "W", "start": "2026-06-20T10:30:00Z",
+        "duration_seconds": 1800,
+    })
+    assert rr.status_code == 201, rr.text
+    assert rr.json()["certificate_id"] == "CW2"
+
+
+def test_slot_closed_interval_handover_point_is_revalidated(client):
+    """闭区间首尾相接：交接点本身两证同时有效（起点不唯一），该点候选
+    必须重验并跳过，最早可确认时段是交接点之后（10:00:01）。"""
+    _submit_topology(
+        client,
+        [
+            _leaf("CW1", "2026-01-01T00:00:00Z", "2026-06-20T10:00:00Z"),
+            _leaf("CW2", "2026-06-20T10:00:00Z", "2027-06-01T00:00:00Z",
+                  issued_at="2026-06-01T00:00:00"),
+        ],
+        [
+            {"child_cert_id": "CW1", "parent_cert_id": "CR"},
+            {"child_cert_id": "CW2", "parent_cert_id": "CR"},
+            {"child_cert_id": "CR", "parent_cert_id": "CG"},
+        ],
+    )
+    # 占用恰在交接点 10:00 结束（半开相接）
+    _seed_busy("2026-06-20T09:00:00Z", "2026-06-20T10:00:00Z", cert="CW1")
+
+    r = client.get("/api/calibration-slots", params={
+        "instrument": "W",
+        "start": "2026-06-20T09:00:00Z",
+        "end": "2026-06-20T12:00:00Z",
+        "duration_seconds": 1800,
+    })
+    d = r.json()
+    assert d["slot"]["start"] == "2026-06-20T10:00:01Z"
+    assert d["certificate_id"] == "CW2"
+
+
+def test_slot_edge_expiry_pushed_after_occupancy_reports_unconfirmable(client):
+    """溯源边先于起点证书失效：占用把候选推过边有效期后，链在候选起点
+    断裂，须沿边界继续搜索；全窗无可确认时段时返回空建议与具体原因，
+    证据对应最早阻断候选而非查询起点。"""
+    _submit_topology(
+        client,
+        [_leaf("CW1", "2026-01-01T00:00:00Z", "2026-12-31T00:00:00Z")],
+        [
+            {"child_cert_id": "CW1", "parent_cert_id": "CR",
+             "valid_from": "2026-01-01T00:00:00Z",
+             "valid_until": "2026-06-20T10:00:00Z"},
+            {"child_cert_id": "CR", "parent_cert_id": "CG"},
+        ],
+    )
+    # 占用把候选推到 10:30：CW1 证书仍有效，但 CW1->CR 边已于 10:00 失效
+    _seed_busy("2026-06-20T09:00:00Z", "2026-06-20T10:30:00Z")
+
+    r = client.get("/api/calibration-slots", params={
+        "instrument": "W",
+        "start": "2026-06-20T09:00:00Z",
+        "end": "2026-06-20T12:00:00Z",
+        "duration_seconds": 1800,
+    })
+    d = r.json()
+    assert d["slot"] is None
+    assert d["reason_code"] == "TRACEABILITY_CHAIN_UNAVAILABLE"
+    assert d["chain_reason_code"] == "CHAIN_BROKEN"
+    assert d["traceability_available"] is False
+    assert d["certificate_id"] is None
+    # 最早阻断候选 = 占用结束点 10:30，而非查询起点 09:00
+    assert d["traceability_at"] == "2026-06-20T10:30:00Z"
+    assert d["trace_report"]["at"] == "2026-06-20T10:30:00Z"
+    assert "10:30:00" in d["reason"]
+
+
+def test_slot_deadline_at_pushed_candidate_gives_specific_reason(client):
+    """占用把候选推到 10:00，该处起点证书 10:30 到期、放不下 1 小时；
+    其后窗内无续期证书 -> 空建议 + CERTIFICATE_DEADLINE_TOO_EARLY，
+    证据对应候选起点。"""
+    _submit_topology(
+        client,
+        [_leaf("CW1", "2026-01-01T00:00:00Z", "2026-06-20T10:30:00Z")],
+        [
+            {"child_cert_id": "CW1", "parent_cert_id": "CR"},
+            {"child_cert_id": "CR", "parent_cert_id": "CG"},
+        ],
+    )
+    _seed_busy("2026-06-20T09:00:00Z", "2026-06-20T10:00:00Z")
+
+    r = client.get("/api/calibration-slots", params={
+        "instrument": "W",
+        "start": "2026-06-20T09:00:00Z",
+        "end": "2026-06-20T11:00:00Z",
+        "duration_seconds": 3600,
+    })
+    d = r.json()
+    assert d["slot"] is None
+    assert d["reason_code"] == "CERTIFICATE_DEADLINE_TOO_EARLY"
+    assert d["traceability_at"] == "2026-06-20T10:00:00Z"
+    assert d["certificate_id"] == "CW1"
+    assert d["certificate_valid_until"] == "2026-06-20T10:30:00Z"
+    assert "10:00:00" in d["reason"]
+
+
+def test_slot_edge_handover_closed_point_rechecked_then_recovers(client):
+    """溯源边在整秒点切换（两条边闭区间在交接点同时有效 -> 多候选），
+    交接点候选跳过，其后新边唯一时恢复可确认。"""
+    _submit_topology(
+        client,
+        [_leaf("CW", "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z")],
+        [
+            {"child_cert_id": "CW", "parent_cert_id": "CR",
+             "valid_until": "2026-06-20T10:00:00Z"},
+            {"child_cert_id": "CR", "parent_cert_id": "CG"},
+        ],
+        extra_instruments=[{"code": "R2", "name": "参考B"}],
+        extra_certs=[
+            {"id": "CR2", "instrument_code": "R2", "cert_number": "R2",
+             "issued_at": "2025-01-01T00:00:00",
+             "valid_from": "2025-01-01T00:00:00", "valid_until": "2030-01-01T00:00:00",
+             "uncertainty": 0.001, "unit": "mm"},
+        ],
+    )
+    client.post("/api/edges", json={
+        "child_cert_id": "CW", "parent_cert_id": "CR2",
+        "valid_from": "2026-06-20T10:00:00Z",
+    })
+    assert client.post("/api/edges", json={
+        "child_cert_id": "CR2", "parent_cert_id": "CG",
+    }).status_code == 201
+    _seed_busy("2026-06-20T09:00:00Z", "2026-06-20T10:00:00Z", cert="CW")
+
+    r = client.get("/api/calibration-slots", params={
+        "instrument": "W",
+        "start": "2026-06-20T09:00:00Z",
+        "end": "2026-06-20T12:00:00Z",
+        "duration_seconds": 1800,
+    })
+    d = r.json()
+    # 10:00 两条边都有效（多候选）-> 跳过；10:00:01 起仅经 CR2 唯一成链
+    assert d["slot"]["start"] == "2026-06-20T10:00:01Z"
+    assert d["certificate_id"] == "CW"
 
 
 # ---------------------------------------------------------------- POST bookings

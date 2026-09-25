@@ -60,7 +60,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（205 个用例）
+pytest -q        # 运行测试（210 个用例）
 ```
 
 本地服务监听 **http://localhost:8000**（与 Docker Compose 映射端口一致）：
@@ -166,7 +166,7 @@ station_maintenance_windows（校准工位维护封锁；UTC 半开区间，与�
 | **GET** | **`/api/trace/{instrument}?at=`** | **链路查询：重建唯一证书链** |
 | **GET** | **`/api/reports/{instrument}?at=`** | **校验报告（冲突明细）** |
 | **GET** | **`/api/coverage/{instrument}?start=&end=`** | **仪器时间窗覆盖查询：按有效期边界输出状态区段** |
-| **GET** | **`/api/calibration-slots?instrument=&start=&end=&duration_seconds=`** | **校准工位空档查询：单工位半开占用，返回时间窗内最早可用时段** |
+| **GET** | **`/api/calibration-slots?instrument=&start=&end=&duration_seconds=`** | **校准工位空档查询：单工位半开占用，沿占用与有效期边界逐点重验溯源链/证书截止，返回最早可确认时段** |
 | **POST** | **`/api/calibration-bookings`** | **确认校准工位预约（同一写事务内重查占用与证书截止，冲突 409）** |
 | **POST** | **`/api/calibration-bookings/reschedule`** | **批量改期 2～10 条已有预约（同一写事务核验，冲突 409 整体回滚）** |
 | **GET** | **`/api/calibration-bookings?instrument=`** | **预约列表（可按仪器筛选）** |
@@ -475,7 +475,7 @@ curl -G "http://localhost:8000/api/coverage/W" \
 **半开区间 `[start_at, end_at)`** 计算：相接但不重叠的两段（如
 `[09:00,10:00)` 与 `[10:00,11:00)`）互不冲突。
 
-**① 查询最早可用时段（只读）。** 输入仪器、UTC 起止时间与所需时长（秒）：
+**① 查询最早可确认时段（只读）。** 输入仪器、UTC 起止时间与所需时长（秒）：
 
 ```bash
 curl -G "http://localhost:8000/api/calibration-slots" \
@@ -494,13 +494,35 @@ curl -G "http://localhost:8000/api/calibration-slots" \
    断裂 / 结果未定 / 校验失败）时 `slot=null`，
    `reason_code=TRACEABILITY_CHAIN_UNAVAILABLE`，
    `chain_reason_code` 给出细分原因，完整证据见响应内的 `trace_report`；
-2. 预约必须在该**唯一有效链起点证书到期前结束**（`end <= valid_until`），
-   搜索窗右端按证书截止裁剪（`search_window_end`），到期前放不下时
-   `reason_code=CERTIFICATE_DEADLINE_TOO_EARLY`；
-3. 用与搜索窗半开相交的既有预约（`busy`，单工位、不分仪器）与
-   **生效中维护封锁窗口**（`maintenance_windows`，两者一并视作占用）
-   贪心求**最早**能容纳所需时长的空档；窗内放不下时
-   `reason_code=NO_FREE_SLOT_IN_WINDOW`（查询窗本身短于时长返回 422）。
+2. 查询起点链有效时，先按与**查询窗半开相交**的既有预约（`busy`，
+   单工位、不分仪器）与**生效中维护封锁窗口**（`maintenance_windows`，
+   两者一并视作占用）把候选起点沿占用段结束点贪心推进（半开相接的
+   候选可用）；
+3. **每个候选起点都重新执行与确认预约相同的门禁**（不沿用查询起点的
+   结论）：该时点唯一有效链仍成立，且预约结束不晚于**该起点证书**
+   `valid_until`（`end == valid_until` 允许）。证书与溯源边有效期是
+   **闭区间**，状态只在边界点及其后切换，因此候选集合除查询起点与
+   占用段结束点外，还覆盖窗内每张相关证书、每条溯源边的有效期边界
+   ——**闭区间交接点本身也要重验**（典型：两证首尾相接时交接点
+   两证同时有效、链不唯一，该瞬时不可用，其后 1 秒恢复），边界之后
+   再取开区间候选。被占用推迟到证书续期 / 边有效期之后的候选，沿
+   边界继续寻找其后**最早可确认时段**；
+4. 找到时返回该时段，响应中的 `traceability_at`、`certificate_id`、
+   `certificate_valid_until` 与 `trace_report` 一律对应**实际建议
+   起点**（不再是查询起点），`slot.ends_by_certificate_valid_until`
+   恒为 true；全窗不存在合格时段时 `slot=null` 并给出具体原因：
+   占用排满 / 窗内放不下为 `NO_FREE_SLOT_IN_WINDOW`，候选起点证书
+   截止不足为 `CERTIFICATE_DEADLINE_TOO_EARLY`，候选起点链不可用为
+   `TRACEABILITY_CHAIN_UNAVAILABLE`（证据取**最早阻断候选起点**的
+   溯源报告，`reason` 注明该候选时刻）；查询窗本身短于时长返回 422。
+
+> **为什么候选起点要逐点重验？** 旧实现只在查询起点判定一次溯源链并按
+> 该起点证书截止预裁剪搜索窗：当工位占用把建议起点推迟到查询起点证书
+> 到期（或溯源边失效、证书闭区间交接）之后，响应仍携带查询起点的证书、
+> 截止与溯源说明，可能给出无法实际确认的时段。现在搜索窗**不再预裁剪**
+> （`search_window_end` 即请求窗终点），每个候选起点都在其真实时刻重验，
+> 返回的建议时段随后直接 `POST /api/calibration-bookings` 即可通过写事务
+> 重查（并发新增占用除外，POST 仍可能 409）。
 
 ```jsonc
 {
@@ -508,24 +530,28 @@ curl -G "http://localhost:8000/api/calibration-slots" \
   "window_start": "2026-06-20T00:00:00Z",
   "window_end": "2026-06-21T00:00:00Z",
   "duration_seconds": 3600,
-  "traceability_at": "2026-06-20T00:00:00Z",   // 链判定时点（= 查询起点）
+  "traceability_at": "2026-06-20T10:00:00Z",   // 链判定时点（= 实际建议起点）
   "traceability_available": true,
-  "certificate_id": "CW1-1",                   // 唯一有效链的起点证书
-  "certificate_valid_until": "2027-01-01T00:00:00Z",
+  "certificate_id": "CW1-2",                   // 实际建议起点的唯一有效链起点证书
+  "certificate_valid_until": "2028-01-01T00:00:00Z",
   "search_window_start": "2026-06-20T00:00:00Z",
-  "search_window_end": "2026-06-21T00:00:00Z", // 受证书截止裁剪后的实际搜索右端
-  "slot": {                                     // 最早可用时段（半开）
-    "start": "2026-06-20T00:00:00Z",
-    "end": "2026-06-20T01:00:00Z",
+  "search_window_end": "2026-06-21T00:00:00Z", // 即请求窗终点（不按证书截止预裁剪）
+  "slot": {                                     // 最早可确认时段（半开）
+    "start": "2026-06-20T10:00:00Z",
+    "end": "2026-06-20T11:00:00Z",
     "ends_by_certificate_valid_until": true
   },
-  "busy": [ /* 与搜索窗半开相交的既有预约：booking_id/instrument_code/start_at/end_at */ ],
-  "trace_report": { /* 查询起点的完整溯源报告，结构同 /api/reports，便于解释原因 */ }
+  "busy": [ /* 与查询窗半开相交的既有预约：booking_id/instrument_code/start_at/end_at */ ],
+  "maintenance_windows": [ /* 与查询窗半开相交的生效维护封锁：同样占用工位 */ ],
+  "trace_report": { /* 实际建议起点的完整溯源报告，结构同 /api/reports */ }
 }
 ```
 
 > 演示库已预置一条 `INST-W1` 在 `2026-06-20T09:00:00Z ~ 10:00:00Z` 的占用，
 > 用 `start=...T09:00:00Z` 查询可看到空档被它推后到 `10:00:00Z`（半开相接）。
+> 若占用把候选推过起点证书的续期交接点，返回的证书与截止会切换为新起点
+> 证书；闭区间交接点本身（新旧两证瞬时同时有效）不可确认，最早时段为
+> 其后 1 秒。
 
 **② 确认预约（写事务，冲突 409）。** 传入仪器、预约起点与时长（结束由
 服务端按 `start + duration_seconds` 计算）。服务端在**同一写事务**
@@ -813,7 +839,8 @@ curl -X POST http://localhost:8000/api/calibration-maintenance-windows \
 - **空档查询**（GET `/api/calibration-slots`）：维护窗口与预约**一并
   视作占用**；预约仍在响应的 `busy` 中列出，维护窗口单独在
   `maintenance_windows` 中列出（含 `maintenance_window_id / start_at /
-  end_at / reason`），最早空档贪心同时避开两者。
+  end_at / reason`），最早可确认时段的候选推进与边界重验同时避开两者
+  （维护段结束点同样作为候选起点重验溯源链与证书截止）。
 - **确认预约**（POST `/api/calibration-bookings`）：在同一写事务内
   重查活跃维护窗口，半开重叠返回 **409**
   （`STATION_UNDER_MAINTENANCE`，附全部冲突窗口），不写入；首尾相接
@@ -1468,7 +1495,8 @@ curl -G "http://localhost:8000/api/calibration-slots" \
   --data-urlencode "start=2026-06-20T09:00:00Z" \
   --data-urlencode "end=2026-06-20T12:00:00Z" \
   --data-urlencode "duration_seconds=3600"
-# slot: 2026-06-20T10:00:00Z ~ 11:00:00Z（09~10 被占用，半开相接后最早空档）
+# slot: 2026-06-20T10:00:00Z ~ 11:00:00Z（09~10 被占用，半开相接后最早
+#       可确认时段；证书/截止/溯源报告均按建议起点 10:00 重验后给出）
 # certificate_id=CW1-1, certificate_valid_until=2027-01-01T00:00:00Z
 
 # 确认预约（结束 11:00，恰在既有占用结束点，半开不冲突）
@@ -1585,9 +1613,14 @@ curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
    最近共同证书，并从各链截取到该证书（含）为止的子链与距离；交集为空时
    明确返回无共同证书。全程不写入业务数据。
 9. 校准工位预约：全实验室单个工位，占用按半开区间 `[start, end)` 计算。
-   GET 在查询起点复用步骤 1~5 要求“唯一成链且零 ERROR”，取起点证书
-   `valid_until` 作为预约必须结束的截止并裁剪搜索窗，再以与搜索窗
-   半开相交的既有预约（不分仪器）贪心求最早可容纳所需时长的空档。
+   GET 先在查询起点复用步骤 1~5 要求“唯一成链且零 ERROR”，随后把与
+   查询窗半开相交的既有预约（不分仪器）与生效维护窗口合并为占用集合，
+   沿占用段结束点贪心推进候选起点；**每个候选起点都重跑步骤 1~5**
+   重验唯一有效链并要求预约结束不晚于该起点证书 `valid_until`，候选
+   集合同时覆盖窗内相关证书/溯源边的有效期边界点（闭区间交接点本身
+   也要重验）与其后开区间，沿边界继续寻找最早可确认时段；搜索窗不按
+   查询起点证书截止预裁剪，响应证据（证书、截止、溯源报告）一律对应
+   实际建议起点。
    POST 在 `BEGIN IMMEDIATE` 同一写事务内重查仪器、溯源链、证书截止与
    半开占用，任一不满足即 409 回滚，全部满足才原子写入；因此并发确认
    同一时段恰有一个成功，不产生重叠预约。批量改期（reschedule）同样在
@@ -1653,7 +1686,9 @@ app/
                      批次共同溯源核查（共同证书选举 + 子链截取）、
                      测量相容性评估（En 数 + 极大团分组）、
                      unique_chain_gate（唯一有效链门禁，工位预约复用）
-  booking.py         校准工位预约：单工位半开占用查询、最早空档贪心、
+  booking.py         校准工位预约：单工位半开占用查询（候选起点沿占用与
+                     证书/溯源边有效期边界逐点重验唯一有效链与起点证书
+                     截止，闭区间交接点也重验，返回最早可确认时段）、
                      写事务内重查确认（409 冲突）、批量改期（旧占用整体
                      排除后核验新时段，409 整体回滚）、候补登记/排队/状态
                      查询与取消补位（同一写事务内释放占用、按队列顺序逐条
@@ -1686,13 +1721,17 @@ tests/test_undetermined.py   10 个枚举截断“结果未定”测试（undete
                              RESULT_UNDETERMINED 拒绝）
 tests/test_preflight.py      11 个批量提交预检测试
 tests/test_deactivation.py   8 个停用影响评估测试
+tests/test_deep_chain.py     8 个超深溯源链显式栈遍历测试
 tests/test_coverage.py       16 个仪器时间窗覆盖查询测试（含 6 个小数秒：
                              交接后半秒单点不双报、截止后同秒报失效、
                              跨截止点窗口分段、交接秒内窗口、时区偏移
                              换算保留微秒、反向小数窗口 422）
 tests/test_common_trace.py   12 个批次共同溯源核查测试
 tests/test_measurement_compatibility.py  14 个测量相容性评估测试
-tests/test_calibration.py    28 个校准工位预约测试
+tests/test_calibration.py    33 个校准工位预约测试（含 5 个空档候选起点
+                             逐点重验：占用推过证书续期后建议起点切换、
+                             闭区间交接点重验、溯源边失效后无可确认时段、
+                             候选起点截止不足、边交接点多候选后恢复）
 tests/test_inspection.py     15 个已确认预约有效性巡检测试（半开窗筛选、
                              422 入参、valid/changed/invalid 三态原因码、
                              稳定排序与汇总、只读不写库）
